@@ -16,7 +16,7 @@ import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from gradio_client import Client, handle_file
+from gradio_client import Client
 from typing import Optional
 import uvicorn
 
@@ -115,7 +115,7 @@ async def generate(
 
             # Passo 1: preprocess (remove background)
             preprocessed = client.predict(
-                input_image=handle_file(tmp_path),
+                input_image=tmp_path,
                 do_remove_background=True,
                 foreground_ratio=0.85,
                 api_name="/preprocess",
@@ -124,7 +124,7 @@ async def generate(
             # Passo 2: generate 3D mesh
             resolution = 256 if quality == "ultra" else 128 if quality == "standard" else 64
             result = client.predict(
-                input_image=handle_file(preprocessed),
+                input_image=preprocessed,
                 mc_resolution=resolution,
                 api_name="/generate_3d",
             )
