@@ -29,7 +29,7 @@ git push -u origin main
 
 No Railway → seu projeto → **Variables**:
 ```
-HF_TOKEN = seu_token_aqui
+HF_TOKEN = hf_xxx
 ```
 
 ### 4. Pegar a URL pública
