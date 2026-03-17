@@ -1,16 +1,15 @@
 """
-SOMOS Engine — FastAPI Backend (PRO VERSION)
+SOMOS Engine — FastAPI Backend (PRO STABLE)
 Deploy: Railway.app
 """
 
 import os
 import hashlib
 import time
-import base64
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from gradio_client import Client
 from typing import Optional
 import uvicorn
@@ -23,6 +22,8 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 TRIPOSR_SPACE = "stabilityai/TripoSR"
 SHAPE_SPACE = "hysts/Shap-E"
+
+TMP_DIR = "/tmp"
 
 QUALITY_STEPS = {
     "low": 12,
@@ -40,7 +41,7 @@ QUALITY_RESOLUTION = {
 # APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SOMOS Engine", version="2.0.0")
+app = FastAPI(title="SOMOS Engine", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,17 +59,39 @@ def compute_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def encode_model(model_bytes: bytes) -> str:
-    return base64.b64encode(model_bytes).decode()
-
-
 def extract_path(result):
-    """Normaliza retorno do Gradio (string ou lista)"""
+    """Normaliza retorno do Gradio"""
     if isinstance(result, str):
         return result
     if isinstance(result, list) and len(result) > 0:
         return result[0]
-    raise ValueError("Formato inesperado de retorno do modelo")
+    raise ValueError(f"Formato inesperado: {type(result)}")
+
+
+def load_model_file(result):
+    """Carrega modelo (URL ou path local)"""
+    path = extract_path(result)
+
+    # Caso seja URL (HF Spaces)
+    if isinstance(path, str) and path.startswith("http"):
+        response = httpx.get(path, timeout=60.0)
+        if response.status_code != 200:
+            raise Exception(f"Erro ao baixar modelo: {response.status_code}")
+        return response.content
+
+    # Caso seja arquivo local
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    raise Exception(f"Arquivo inválido retornado: {path}")
+
+
+def save_temp_file(data: bytes, file_id: str) -> str:
+    path = os.path.join(TMP_DIR, f"{file_id}.glb")
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
 
 
 # ─────────────────────────────────────────────
@@ -79,7 +102,7 @@ def extract_path(result):
 def root():
     return {
         "status": "online",
-        "engine": "SOMOS Engine v2.0",
+        "engine": "SOMOS Engine v3.0",
         "hf_token": bool(HF_TOKEN),
     }
 
@@ -139,9 +162,8 @@ async def generate(
     if mode in ["image", "camera"] and not image:
         raise HTTPException(400, "imagem obrigatória")
 
-    # ── TOKEN CHECK ───────────────────────────
     if not HF_TOKEN:
-        raise HTTPException(500, "HF_TOKEN não configurado no servidor")
+        raise HTTPException(500, "HF_TOKEN não configurado")
 
     try:
         # ==========================================================
@@ -150,15 +172,15 @@ async def generate(
         if mode in ("image", "camera"):
 
             image_bytes = await image.read()
-            tmp_path = f"/tmp/input_{int(time.time())}.jpg"
+            tmp_input = os.path.join(TMP_DIR, f"input_{int(time.time())}.jpg")
 
-            with open(tmp_path, "wb") as f:
+            with open(tmp_input, "wb") as f:
                 f.write(image_bytes)
 
             client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
 
             preprocessed = client.predict(
-                input_image=tmp_path,
+                input_image=tmp_input,
                 do_remove_background=True,
                 foreground_ratio=0.85,
                 api_name="/preprocess",
@@ -170,7 +192,7 @@ async def generate(
                 api_name="/generate_3d",
             )
 
-            model_path = extract_path(result)
+            engine_used = "triposr"
 
         # ==========================================================
         # TEXT → 3D (SHAP-E)
@@ -185,27 +207,43 @@ async def generate(
                 api_name="/text-to-3d",
             )
 
-            model_path = extract_path(result)
+            engine_used = "shap-e"
 
-        # ── LOAD RESULT ───────────────────────
-        with open(model_path, "rb") as f:
-            model_bytes = f.read()
+        # ── LOAD MODEL ─────────────────────────
+        model_bytes = load_model_file(result)
 
+        # ── HASH ───────────────────────────────
         model_hash = compute_hash(model_bytes)
+
+        # ── SAVE TEMP FILE ─────────────────────
+        save_temp_file(model_bytes, model_hash)
 
         return JSONResponse({
             "success": True,
-            "modelUrl": f"data:model/gltf-binary;base64,{encode_model(model_bytes)}",
+            "downloadUrl": f"/download/{model_hash}",
             "format": "glb",
             "hash": model_hash,
             "ipfsCid": f"Qm{model_hash[:44]}",
-            "engine": "triposr" if mode != "text" else "shap-e",
+            "engine": engine_used,
             "duration": round(time.time() - t0),
-            "mock": False,
         })
 
     except Exception as e:
         raise HTTPException(500, f"Erro no engine: {str(e)}")
+
+
+@app.get("/download/{file_id}")
+def download(file_id: str):
+    path = os.path.join(TMP_DIR, f"{file_id}.glb")
+
+    if not os.path.exists(path):
+        raise HTTPException(404, "Arquivo não encontrado")
+
+    return FileResponse(
+        path,
+        media_type="model/gltf-binary",
+        filename=f"{file_id}.glb"
+    )
 
 
 @app.post("/hash")
