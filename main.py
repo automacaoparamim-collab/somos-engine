@@ -98,7 +98,6 @@ async def generate(
             with open(tmp_path, "wb") as f:
                 f.write(image_bytes)
 
-            # FIX: token= em vez de hf_token=
             client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
 
             preprocessed = client.predict(
@@ -133,17 +132,17 @@ async def generate(
                 "mock": False,
             })
 
-        # ── TEXT → Shap-E ────────────────────────────────────────────────
+        # ── TEXT → Shap-E (argumentos posicionais — API compatível) ─────
         elif mode == "text" and prompt:
-            # FIX: token= em vez de hf_token=
             client = Client(SHAPE_SPACE, token=HF_TOKEN)
 
             steps = 64 if quality == "ultra" else 32 if quality == "standard" else 16
+
+            # Usa argumentos posicionais para evitar erro de parâmetros renomeados
             result = client.predict(
-                prompt=prompt,
-                guidance_scale=15.0,
-                num_inference_steps=steps,
-                frame_size=256 if quality == "ultra" else 128,
+                prompt,
+                15.0,
+                steps,
                 api_name="/text-to-3d",
             )
 
