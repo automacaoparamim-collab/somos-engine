@@ -1,5 +1,5 @@
 """
-SOMOS Engine — FastAPI Backend (PRO STABLE)
+SOMOS Engine — FastAPI Backend (PRO FINAL - STREAM RESPONSE)
 Deploy: Railway.app
 """
 
@@ -7,9 +7,10 @@ import os
 import hashlib
 import time
 import httpx
+import traceback
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import Response, JSONResponse
 from gradio_client import Client
 from typing import Optional
 import uvicorn
@@ -22,8 +23,6 @@ HF_TOKEN = os.environ.get("HF_TOKEN")
 
 TRIPOSR_SPACE = "stabilityai/TripoSR"
 SHAPE_SPACE = "hysts/Shap-E"
-
-TMP_DIR = "/tmp"
 
 QUALITY_STEPS = {
     "low": 12,
@@ -41,11 +40,11 @@ QUALITY_RESOLUTION = {
 # APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SOMOS Engine", version="3.0.0")
+app = FastAPI(title="SOMOS Engine", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restringir em produção
+    allow_origins=["*"],  # restringir em produção depois
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,7 +59,6 @@ def compute_hash(data: bytes) -> str:
 
 
 def extract_path(result):
-    """Normaliza retorno do Gradio"""
     if isinstance(result, str):
         return result
     if isinstance(result, list) and len(result) > 0:
@@ -69,29 +67,21 @@ def extract_path(result):
 
 
 def load_model_file(result):
-    """Carrega modelo (URL ou path local)"""
     path = extract_path(result)
 
-    # Caso seja URL (HF Spaces)
+    # URL (caso HF retorne link)
     if isinstance(path, str) and path.startswith("http"):
         response = httpx.get(path, timeout=60.0)
         if response.status_code != 200:
-            raise Exception(f"Erro ao baixar modelo: {response.status_code}")
+            raise Exception(f"Erro download HF: {response.status_code}")
         return response.content
 
-    # Caso seja arquivo local
+    # Arquivo local
     if os.path.exists(path):
         with open(path, "rb") as f:
             return f.read()
 
-    raise Exception(f"Arquivo inválido retornado: {path}")
-
-
-def save_temp_file(data: bytes, file_id: str) -> str:
-    path = os.path.join(TMP_DIR, f"{file_id}.glb")
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
+    raise Exception(f"Arquivo inválido: {path}")
 
 
 # ─────────────────────────────────────────────
@@ -102,7 +92,7 @@ def save_temp_file(data: bytes, file_id: str) -> str:
 def root():
     return {
         "status": "online",
-        "engine": "SOMOS Engine v3.0",
+        "engine": "SOMOS Engine v4.0",
         "hf_token": bool(HF_TOKEN),
     }
 
@@ -172,15 +162,15 @@ async def generate(
         if mode in ("image", "camera"):
 
             image_bytes = await image.read()
-            tmp_input = os.path.join(TMP_DIR, f"input_{int(time.time())}.jpg")
+            tmp_path = f"/tmp/input_{int(time.time())}.jpg"
 
-            with open(tmp_input, "wb") as f:
+            with open(tmp_path, "wb") as f:
                 f.write(image_bytes)
 
             client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
 
             preprocessed = client.predict(
-                input_image=tmp_input,
+                input_image=tmp_path,
                 do_remove_background=True,
                 foreground_ratio=0.85,
                 api_name="/preprocess",
@@ -215,35 +205,23 @@ async def generate(
         # ── HASH ───────────────────────────────
         model_hash = compute_hash(model_bytes)
 
-        # ── SAVE TEMP FILE ─────────────────────
-        save_temp_file(model_bytes, model_hash)
+        duration = round(time.time() - t0)
 
-        return JSONResponse({
-            "success": True,
-            "downloadUrl": f"/download/{model_hash}",
-            "format": "glb",
-            "hash": model_hash,
-            "ipfsCid": f"Qm{model_hash[:44]}",
-            "engine": engine_used,
-            "duration": round(time.time() - t0),
-        })
+        # ── RESPONSE DIRETA (SEM /tmp / download) ──
+        return Response(
+            content=model_bytes,
+            media_type="model/gltf-binary",
+            headers={
+                "Content-Disposition": f"attachment; filename={model_hash}.glb",
+                "X-Model-Hash": model_hash,
+                "X-Engine": engine_used,
+                "X-Duration": str(duration),
+            }
+        )
 
     except Exception as e:
+        print("ERRO REAL:\n", traceback.format_exc())
         raise HTTPException(500, f"Erro no engine: {str(e)}")
-
-
-@app.get("/download/{file_id}")
-def download(file_id: str):
-    path = os.path.join(TMP_DIR, f"{file_id}.glb")
-
-    if not os.path.exists(path):
-        raise HTTPException(404, "Arquivo não encontrado")
-
-    return FileResponse(
-        path,
-        media_type="model/gltf-binary",
-        filename=f"{file_id}.glb"
-    )
 
 
 @app.post("/hash")
