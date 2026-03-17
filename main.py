@@ -139,12 +139,14 @@ async def generate(
             client = Client(SHAPE_SPACE, token=HF_TOKEN)
 
             steps = 64 if quality == "ultra" else 32 if quality == "standard" else 16
-result = client.predict(
-    prompt,
-    15.0,
-    steps,
-    api_name="/text-to-3d",
-)
+
+	result = client.predict(
+    	prompt,
+    	15.0,
+    	steps,
+    	api_name="/text-to-3d",
+	)
+
             model_path = result if isinstance(result, str) else result[0]
             with open(model_path, "rb") as f:
                 model_bytes = f.read()
