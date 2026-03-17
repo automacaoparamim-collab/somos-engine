@@ -1,12 +1,6 @@
 """
 SOMOS Engine — FastAPI Backend
 Deploy: Railway.app (free tier, sem timeout)
-
-Endpoints:
-  POST /generate     → chama HF Space (Shap-E ou TripoSR) sem limite de tempo
-  POST /hash         → SHA-256 de texto ou arquivo
-  GET  /status       → saúde da API e status dos Spaces
-  GET  /             → healthcheck Railway
 """
 
 import os
@@ -22,16 +16,15 @@ import uvicorn
 
 app = FastAPI(title="SOMOS Engine", version="1.0.0")
 
-# CORS — permite chamadas do Vercel
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Em produção: ["https://somos-studio-exj5.vercel.app"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_TOKEN      = os.environ.get("HF_TOKEN", "")
 TRIPOSR_SPACE = "stabilityai/TripoSR"
 SHAPE_SPACE   = "hysts/Shap-E"
 
@@ -47,7 +40,6 @@ def root():
 
 @app.get("/status")
 async def status():
-    """Verifica conectividade com HF Spaces."""
     results = {}
     for name, space in [("triposr", TRIPOSR_SPACE), ("shape_e", SHAPE_SPACE)]:
         try:
@@ -81,14 +73,9 @@ async def generate(
     style: str = Form("realistic"),
     image: Optional[UploadFile] = File(None),
 ):
-    """
-    Gera modelo 3D via HF Space.
-    Sem limite de tempo — espera o Space responder (30-90s cold start).
-    """
     t0 = time.time()
 
     if not HF_TOKEN:
-        # Modo demo — retorna mock com hash real
         fake_data = f"{mode}{prompt}{quality}{time.time()}".encode()
         hash_val = compute_hash(fake_data)
         return JSONResponse({
@@ -104,16 +91,16 @@ async def generate(
         })
 
     try:
-        # ── IMAGE / CAMERA → TripoSR ────────────────────────────────────────
+        # ── IMAGE / CAMERA → TripoSR ─────────────────────────────────────
         if mode in ("image", "camera") and image:
             image_bytes = await image.read()
             tmp_path = f"/tmp/input_{int(time.time())}.jpg"
             with open(tmp_path, "wb") as f:
                 f.write(image_bytes)
 
-            client = Client(TRIPOSR_SPACE, hf_token=HF_TOKEN)
+            # FIX: token= em vez de hf_token=
+            client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
 
-            # Passo 1: preprocess (remove background)
             preprocessed = client.predict(
                 input_image=tmp_path,
                 do_remove_background=True,
@@ -121,7 +108,6 @@ async def generate(
                 api_name="/preprocess",
             )
 
-            # Passo 2: generate 3D mesh
             resolution = 256 if quality == "ultra" else 128 if quality == "standard" else 64
             result = client.predict(
                 input_image=preprocessed,
@@ -129,9 +115,7 @@ async def generate(
                 api_name="/generate_3d",
             )
 
-            # result é o caminho do arquivo GLB gerado
             model_path = result if isinstance(result, str) else result[0]
-
             with open(model_path, "rb") as f:
                 model_bytes = f.read()
 
@@ -149,9 +133,10 @@ async def generate(
                 "mock": False,
             })
 
-        # ── TEXT → Shap-E ───────────────────────────────────────────────────
+        # ── TEXT → Shap-E ────────────────────────────────────────────────
         elif mode == "text" and prompt:
-            client = Client(SHAPE_SPACE, hf_token=HF_TOKEN)
+            # FIX: token= em vez de hf_token=
+            client = Client(SHAPE_SPACE, token=HF_TOKEN)
 
             steps = 64 if quality == "ultra" else 32 if quality == "standard" else 16
             result = client.predict(
@@ -163,7 +148,6 @@ async def generate(
             )
 
             model_path = result if isinstance(result, str) else result[0]
-
             with open(model_path, "rb") as f:
                 model_bytes = f.read()
 
@@ -185,7 +169,6 @@ async def generate(
             raise HTTPException(status_code=400, detail="Parâmetros inválidos")
 
     except Exception as e:
-        # Fallback gracioso
         fake_data = f"{mode}{prompt}{time.time()}".encode()
         hash_val = compute_hash(fake_data)
         return JSONResponse({
@@ -206,7 +189,6 @@ async def hash_data(
     data: str = Form(""),
     file: Optional[UploadFile] = File(None),
 ):
-    """Computa SHA-256 de texto ou arquivo."""
     if file:
         content = await file.read()
         return {"hash": compute_hash(content), "source": "file", "filename": file.filename}
