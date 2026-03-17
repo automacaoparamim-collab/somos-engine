@@ -1,5 +1,5 @@
 """
-SOMOS Engine — FastAPI Backend (PRO FINAL - STREAM RESPONSE)
+SOMOS Engine — FastAPI Backend (PRO STABLE v3.1)
 Deploy: Railway.app
 """
 
@@ -10,7 +10,7 @@ import httpx
 import traceback
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response
 from gradio_client import Client
 from typing import Optional
 import uvicorn
@@ -40,11 +40,11 @@ QUALITY_RESOLUTION = {
 # APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SOMOS Engine", version="4.0.0")
+app = FastAPI(title="SOMOS Engine", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restringir em produção depois
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,20 +69,19 @@ def extract_path(result):
 def load_model_file(result):
     path = extract_path(result)
 
-    # URL (caso HF retorne link)
+    # URL (HF Spaces)
     if isinstance(path, str) and path.startswith("http"):
-        response = httpx.get(path, timeout=60.0)
+        response = httpx.get(path, timeout=120.0)
         if response.status_code != 200:
-            raise Exception(f"Erro download HF: {response.status_code}")
+            raise Exception(f"Erro ao baixar modelo: {response.status_code}")
         return response.content
 
-    # Arquivo local
+    # Local
     if os.path.exists(path):
         with open(path, "rb") as f:
             return f.read()
 
-    raise Exception(f"Arquivo inválido: {path}")
-
+    raise Exception(f"Arquivo inválido retornado: {path}")
 
 # ─────────────────────────────────────────────
 # ROUTES
@@ -92,40 +91,8 @@ def load_model_file(result):
 def root():
     return {
         "status": "online",
-        "engine": "SOMOS Engine v4.0",
+        "engine": "SOMOS Engine v3.1",
         "hf_token": bool(HF_TOKEN),
-    }
-
-
-@app.get("/status")
-async def status():
-    results = {}
-
-    for name, space in [("triposr", TRIPOSR_SPACE), ("shape_e", SHAPE_SPACE)]:
-        try:
-            headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await client.get(
-                    f"https://huggingface.co/api/spaces/{space}",
-                    headers=headers,
-                )
-
-            data = r.json()
-
-            results[name] = {
-                "space": space,
-                "status": data.get("runtime", {}).get("stage", "unknown"),
-                "ok": r.status_code == 200,
-            }
-
-        except Exception as e:
-            results[name] = {"space": space, "status": "error", "error": str(e)}
-
-    return {
-        "api": "online",
-        "hf_token": "configured" if HF_TOKEN else "not set",
-        "spaces": results,
     }
 
 
@@ -161,21 +128,24 @@ async def generate(
         # ==========================================================
         if mode in ("image", "camera"):
 
+            print("[rembg] Background removal...")
             image_bytes = await image.read()
-            tmp_path = f"/tmp/input_{int(time.time())}.jpg"
 
-            with open(tmp_path, "wb") as f:
+            tmp_input = f"/tmp/input_{int(time.time())}.jpg"
+            with open(tmp_input, "wb") as f:
                 f.write(image_bytes)
 
             client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
 
+            print("[vit] Extracting image features via ViT...")
             preprocessed = client.predict(
-                input_image=tmp_path,
+                input_image=tmp_input,
                 do_remove_background=True,
                 foreground_ratio=0.85,
                 api_name="/preprocess",
             )
 
+            print("[zero123++] Generating views...")
             result = client.predict(
                 input_image=preprocessed,
                 mc_resolution=QUALITY_RESOLUTION[quality],
@@ -200,14 +170,18 @@ async def generate(
             engine_used = "shap-e"
 
         # ── LOAD MODEL ─────────────────────────
+        print("[mesh] Processing mesh...")
         model_bytes = load_model_file(result)
 
         # ── HASH ───────────────────────────────
+        print("[crypto] Computing SHA-256...")
         model_hash = compute_hash(model_bytes)
 
-        duration = round(time.time() - t0)
+        duration = round(time.time() - t0, 2)
 
-        # ── RESPONSE DIRETA (SEM /tmp / download) ──
+        print(f"[done] Model ready: {model_hash}")
+
+        # 🚀 RESPOSTA DIRETA (SEM /tmp /download)
         return Response(
             content=model_bytes,
             media_type="model/gltf-binary",
@@ -216,11 +190,11 @@ async def generate(
                 "X-Model-Hash": model_hash,
                 "X-Engine": engine_used,
                 "X-Duration": str(duration),
-            }
+            },
         )
 
     except Exception as e:
-        print("ERRO REAL:\n", traceback.format_exc())
+        print("🔥 ERRO REAL:\n", traceback.format_exc())
         raise HTTPException(500, f"Erro no engine: {str(e)}")
 
 
