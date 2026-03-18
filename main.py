@@ -1,5 +1,5 @@
 """
-SOMOS Engine — FastAPI Backend (PRO STABLE v3.1)
+SOMOS Engine — FastAPI Backend (PRO HARDENED v3.2)
 Deploy: Railway.app
 """
 
@@ -10,10 +10,11 @@ import httpx
 import traceback
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 from gradio_client import Client
-from typing import Optional
+from typing import Optional, Union
 import uvicorn
+from io import BytesIO
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -36,11 +37,13 @@ QUALITY_RESOLUTION = {
     "ultra": 384,
 }
 
+HTTP_TIMEOUT = 180.0
+
 # ─────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SOMOS Engine", version="3.1.0")
+app = FastAPI(title="SOMOS Engine", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,30 +61,48 @@ def compute_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def extract_path(result):
+def extract_path(result: Union[str, list]) -> str:
     if isinstance(result, str):
         return result
-    if isinstance(result, list) and len(result) > 0:
+    if isinstance(result, list) and result:
         return result[0]
-    raise ValueError(f"Formato inesperado: {type(result)}")
+    raise ValueError(f"Formato inválido retornado pelo Gradio: {type(result)}")
+
+
+def download_with_retry(url: str) -> bytes:
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+                r = client.get(url)
+                if r.status_code == 200:
+                    if len(r.content) < 1000:
+                        raise Exception("Arquivo muito pequeno/corrompido")
+                    return r.content
+                else:
+                    raise Exception(f"HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[retry {attempt+1}] erro download:", str(e))
+            time.sleep(1)
+
+    raise Exception("Falha ao baixar modelo após 3 tentativas")
 
 
 def load_model_file(result):
     path = extract_path(result)
 
-    # URL (HF Spaces)
-    if isinstance(path, str) and path.startswith("http"):
-        response = httpx.get(path, timeout=120.0)
-        if response.status_code != 200:
-            raise Exception(f"Erro ao baixar modelo: {response.status_code}")
-        return response.content
+    # URL
+    if path.startswith("http"):
+        return download_with_retry(path)
 
     # Local
     if os.path.exists(path):
         with open(path, "rb") as f:
-            return f.read()
+            data = f.read()
+            if len(data) < 1000:
+                raise Exception("Arquivo local inválido/corrompido")
+            return data
 
-    raise Exception(f"Arquivo inválido retornado: {path}")
+    raise Exception(f"Arquivo inválido: {path}")
 
 # ─────────────────────────────────────────────
 # ROUTES
@@ -91,7 +112,7 @@ def load_model_file(result):
 def root():
     return {
         "status": "online",
-        "engine": "SOMOS Engine v3.1",
+        "engine": "SOMOS Engine v3.2 HARDENED",
         "hf_token": bool(HF_TOKEN),
     }
 
@@ -123,12 +144,13 @@ async def generate(
         raise HTTPException(500, "HF_TOKEN não configurado")
 
     try:
+        print(f"[somos] start | mode={mode} | quality={quality}")
+
         # ==========================================================
-        # IMAGE → 3D (TRIPOSR)
+        # IMAGE → 3D
         # ==========================================================
         if mode in ("image", "camera"):
 
-            print("[rembg] Background removal...")
             image_bytes = await image.read()
 
             tmp_input = f"/tmp/input_{int(time.time())}.jpg"
@@ -137,7 +159,7 @@ async def generate(
 
             client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
 
-            print("[vit] Extracting image features via ViT...")
+            print("[step] preprocess")
             preprocessed = client.predict(
                 input_image=tmp_input,
                 do_remove_background=True,
@@ -145,7 +167,7 @@ async def generate(
                 api_name="/preprocess",
             )
 
-            print("[zero123++] Generating views...")
+            print("[step] generate_3d")
             result = client.predict(
                 input_image=preprocessed,
                 mc_resolution=QUALITY_RESOLUTION[quality],
@@ -155,11 +177,12 @@ async def generate(
             engine_used = "triposr"
 
         # ==========================================================
-        # TEXT → 3D (SHAP-E)
+        # TEXT → 3D
         # ==========================================================
         else:
             client = Client(SHAPE_SPACE, token=HF_TOKEN)
 
+            print("[step] text_to_3d")
             result = client.predict(
                 prompt=prompt,
                 guidance_scale=15.0,
@@ -170,32 +193,31 @@ async def generate(
             engine_used = "shap-e"
 
         # ── LOAD MODEL ─────────────────────────
-        print("[mesh] Processing mesh...")
+        print("[step] load_model")
         model_bytes = load_model_file(result)
 
         # ── HASH ───────────────────────────────
-        print("[crypto] Computing SHA-256...")
         model_hash = compute_hash(model_bytes)
-
         duration = round(time.time() - t0, 2)
 
-        print(f"[done] Model ready: {model_hash}")
+        print(f"[done] {model_hash} | {duration}s")
 
-        # 🚀 RESPOSTA DIRETA (SEM /tmp /download)
-        return Response(
-            content=model_bytes,
+        # ── STREAM RESPONSE ────────────────────
+        return StreamingResponse(
+            BytesIO(model_bytes),
             media_type="model/gltf-binary",
             headers={
                 "Content-Disposition": f"attachment; filename={model_hash}.glb",
                 "X-Model-Hash": model_hash,
                 "X-Engine": engine_used,
                 "X-Duration": str(duration),
+                "Cache-Control": "no-store"
             },
         )
 
     except Exception as e:
-        print("🔥 ERRO REAL:\n", traceback.format_exc())
-        raise HTTPException(500, f"Erro no engine: {str(e)}")
+        print("🔥 ERRO COMPLETO:\n", traceback.format_exc())
+        raise HTTPException(500, str(e))
 
 
 @app.post("/hash")
