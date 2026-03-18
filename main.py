@@ -1,6 +1,8 @@
 """
-SOMOS Engine — FastAPI Backend (PRO VERSION)
+SOMOS Engine — FastAPI Backend v2.2
 Deploy: Railway.app
+Image→3D: microsoft/TRELLIS.2 (superior ao TripoSR)
+Text→3D:  hysts/Shap-E
 """
 
 import os
@@ -11,7 +13,7 @@ import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from gradio_client import Client
+from gradio_client import Client, handle_file
 from typing import Optional
 import uvicorn
 
@@ -21,26 +23,21 @@ import uvicorn
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-TRIPOSR_SPACE = "stabilityai/TripoSR"
-SHAPE_SPACE   = "hysts/Shap-E"
+TRELLIS_SPACE = "microsoft/TRELLIS.2"   # imagem → 3D (melhor qualidade)
+TRELLIS_V1    = "JeffreyXiang/TRELLIS"  # fallback v1 se v2 estiver offline
+SHAPE_SPACE   = "hysts/Shap-E"          # texto → 3D
 
 QUALITY_STEPS = {
-    "low": 12,
+    "low":      12,
     "standard": 16,
-    "ultra": 20,
-}
-
-QUALITY_RESOLUTION = {
-    "low": 128,
-    "standard": 256,
-    "ultra": 384,
+    "ultra":    20,
 }
 
 # ─────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SOMOS Engine", version="2.1.0")
+app = FastAPI(title="SOMOS Engine", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +58,7 @@ def encode_model(model_bytes: bytes) -> str:
     return base64.b64encode(model_bytes).decode()
 
 def extract_path(result):
+    """Normaliza retorno do Gradio (string, lista, dict)"""
     if isinstance(result, str):
         return result
     if isinstance(result, (list, tuple)) and len(result) > 0:
@@ -70,6 +68,8 @@ def extract_path(result):
         if isinstance(item, dict):
             return item.get("name") or item.get("path") or item.get("url") or str(item)
         return str(item)
+    if isinstance(result, dict):
+        return result.get("name") or result.get("path") or result.get("url") or str(result)
     raise ValueError(f"Formato inesperado: {type(result)} = {result}")
 
 def mock_response(mode: str, prompt: str, t0: float, error: str):
@@ -95,7 +95,7 @@ def mock_response(mode: str, prompt: str, t0: float, error: str):
 def root():
     return {
         "status": "online",
-        "engine": "SOMOS Engine v2.1",
+        "engine": "SOMOS Engine v2.2",
         "hf_token": bool(HF_TOKEN),
     }
 
@@ -103,7 +103,7 @@ def root():
 @app.get("/status")
 async def status():
     results = {}
-    for name, space in [("triposr", TRIPOSR_SPACE), ("shape_e", SHAPE_SPACE)]:
+    for name, space in [("trellis2", TRELLIS_SPACE), ("shape_e", SHAPE_SPACE)]:
         try:
             headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -121,19 +121,19 @@ async def status():
             results[name] = {"space": space, "status": "error", "error": str(e)}
 
     return {
-        "api":       "online",
-        "hf_token":  "configured" if HF_TOKEN else "not set",
-        "spaces":    results,
+        "api":      "online",
+        "hf_token": "configured" if HF_TOKEN else "not set",
+        "spaces":   results,
     }
 
 
 @app.post("/generate")
 async def generate(
-    mode:    str                    = Form(...),
-    prompt:  str                    = Form(""),
-    quality: str                    = Form("standard"),
-    style:   str                    = Form("realistic"),
-    image:   Optional[UploadFile]   = File(None),
+    mode:    str                   = Form(...),
+    prompt:  str                   = Form(""),
+    quality: str                   = Form("standard"),
+    style:   str                   = Form("realistic"),
+    image:   Optional[UploadFile]  = File(None),
 ):
     t0 = time.time()
 
@@ -142,7 +142,7 @@ async def generate(
 
     try:
         # ==========================================================
-        # IMAGE → 3D  (TripoSR)
+        # IMAGE / CAMERA → 3D  (TRELLIS.2)
         # ==========================================================
         if mode in ("image", "camera"):
             if not image:
@@ -153,39 +153,41 @@ async def generate(
             with open(tmp_path, "wb") as f:
                 f.write(image_bytes)
 
-            client = Client(TRIPOSR_SPACE, token=HF_TOKEN)
+            steps = QUALITY_STEPS.get(quality, 16)
+            model_path = None
 
-            # Tenta com parâmetros nomeados primeiro
+            # Tenta TRELLIS.2 primeiro
             try:
-                preprocessed = client.predict(
-                    input_image=tmp_path,
-                    do_remove_background=True,
-                    foreground_ratio=0.85,
-                    api_name="/preprocess",
-                )
-            except TypeError:
-                # Fallback posicional se API mudou
-                preprocessed = client.predict(
-                    tmp_path, True, 0.85,
-                    api_name="/preprocess",
-                )
-
-            preprocessed_path = extract_path(preprocessed)
-
-            try:
+                client = Client(TRELLIS_SPACE, token=HF_TOKEN)
                 result = client.predict(
-                    input_image=preprocessed_path,
-                    mc_resolution=QUALITY_RESOLUTION.get(quality, 256),
-                    api_name="/generate_3d",
+                    handle_file(tmp_path),  # imagem
+                    0,                      # seed
+                    7.5,                    # ss_guidance_strength
+                    steps,                  # ss_sampling_steps
+                    3.0,                    # slat_guidance_strength
+                    steps,                  # slat_sampling_steps
+                    api_name="/image_to_3d",
                 )
-            except TypeError:
-                result = client.predict(
-                    preprocessed_path,
-                    QUALITY_RESOLUTION.get(quality, 256),
-                    api_name="/generate_3d",
-                )
+                model_path = extract_path(result)
 
-            model_path = extract_path(result)
+            except Exception as e1:
+                # Fallback para TRELLIS v1
+                try:
+                    client = Client(TRELLIS_V1, token=HF_TOKEN)
+                    result = client.predict(
+                        image=handle_file(tmp_path),
+                        multiimages=[],
+                        seed=0,
+                        ss_guidance_strength=7.5,
+                        ss_sampling_steps=steps,
+                        slat_guidance_strength=3.0,
+                        slat_sampling_steps=steps,
+                        multiimage_algo="stochastic",
+                        api_name="/image_to_3d",
+                    )
+                    model_path = extract_path(result)
+                except Exception as e2:
+                    return mock_response(mode, prompt, t0, f"TRELLIS.2: {e1} | v1: {e2}")
 
         # ==========================================================
         # TEXT → 3D  (Shap-E)
@@ -197,14 +199,12 @@ async def generate(
             client = Client(SHAPE_SPACE, token=HF_TOKEN)
             steps  = QUALITY_STEPS.get(quality, 16)
 
-            # Usa posicionais — evita erros de parâmetros renomeados
             result = client.predict(
                 prompt,
                 15.0,
                 steps,
                 api_name="/text-to-3d",
             )
-
             model_path = extract_path(result)
 
         # ── LÊ O ARQUIVO GERADO ───────────────
@@ -212,7 +212,7 @@ async def generate(
             model_bytes = f.read()
 
         model_hash = compute_hash(model_bytes)
-        engine     = "triposr" if mode != "text" else "shap-e"
+        engine     = "trellis2" if mode != "text" else "shap-e"
 
         return JSONResponse({
             "success":  True,
@@ -226,7 +226,6 @@ async def generate(
         })
 
     except Exception as e:
-        # Retorna fallback gracioso em vez de 500
         return mock_response(mode, prompt, t0, str(e))
 
 
