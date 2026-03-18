@@ -1,8 +1,9 @@
 """
-SOMOS Engine — FastAPI Backend v2.2
+SOMOS Engine — FastAPI Backend v3.0
 Deploy: Railway.app
-Image→3D: microsoft/TRELLIS.2 (superior ao TripoSR)
-Text→3D:  hysts/Shap-E
+
+Imagem → 3D:  Hunyuan3D-2.1 → TRELLIS.2 → TRELLIS v1 → TripoSG
+Texto  → 3D:  Hunyuan3D-2.0 → Shap-E
 """
 
 import os
@@ -23,21 +24,31 @@ import uvicorn
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-TRELLIS_SPACE = "microsoft/TRELLIS.2"   # imagem → 3D (melhor qualidade)
-TRELLIS_V1    = "JeffreyXiang/TRELLIS"  # fallback v1 se v2 estiver offline
-SHAPE_SPACE   = "hysts/Shap-E"          # texto → 3D
+# Imagem → 3D (cadeia de fallback)
+IMAGE_ENGINES = [
+    "tencent/Hunyuan3D-2.1",
+    "microsoft/TRELLIS.2",
+    "trellis-community/TRELLIS",
+    "VAST-AI/TripoSG",
+]
+
+# Texto → 3D (cadeia de fallback)
+TEXT_ENGINES = [
+    "tencent/Hunyuan3D-2",
+    "hysts/Shap-E",
+]
 
 QUALITY_STEPS = {
     "low":      12,
-    "standard": 16,
-    "ultra":    20,
+    "standard": 20,
+    "ultra":    30,
 }
 
 # ─────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="SOMOS Engine", version="2.2.0")
+app = FastAPI(title="SOMOS Engine", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,19 +69,22 @@ def encode_model(model_bytes: bytes) -> str:
     return base64.b64encode(model_bytes).decode()
 
 def extract_path(result):
-    """Normaliza retorno do Gradio (string, lista, dict)"""
-    if isinstance(result, str):
+    """Normaliza qualquer formato de retorno do Gradio"""
+    if isinstance(result, str) and os.path.exists(result):
         return result
     if isinstance(result, (list, tuple)) and len(result) > 0:
         item = result[0]
         if isinstance(item, str):
             return item
         if isinstance(item, dict):
-            return item.get("name") or item.get("path") or item.get("url") or str(item)
-        return str(item)
+            for key in ("name", "path", "url", "value"):
+                if item.get(key):
+                    return item[key]
     if isinstance(result, dict):
-        return result.get("name") or result.get("path") or result.get("url") or str(result)
-    raise ValueError(f"Formato inesperado: {type(result)} = {result}")
+        for key in ("name", "path", "url", "value"):
+            if result.get(key):
+                return result[key]
+    raise ValueError(f"Não foi possível extrair caminho: {type(result)} = {str(result)[:200]}")
 
 def mock_response(mode: str, prompt: str, t0: float, error: str):
     fake_data = f"{mode}{prompt}{time.time()}".encode()
@@ -88,37 +102,121 @@ def mock_response(mode: str, prompt: str, t0: float, error: str):
     })
 
 # ─────────────────────────────────────────────
+# ENGINE: IMAGEM → 3D
+# ─────────────────────────────────────────────
+
+def try_hunyuan3d_image(tmp_path: str, steps: int) -> str:
+    client = Client("tencent/Hunyuan3D-2.1", token=HF_TOKEN)
+    result = client.predict(
+        handle_file(tmp_path),  # imagem
+        "",                     # prompt opcional
+        1,                      # seed
+        steps,                  # num_steps
+        7.5,                    # guidance_scale
+        True,                   # remove_background
+        api_name="/generate",
+    )
+    return extract_path(result)
+
+
+def try_trellis2_image(tmp_path: str, steps: int) -> str:
+    client = Client("microsoft/TRELLIS.2", token=HF_TOKEN)
+    result = client.predict(
+        handle_file(tmp_path),
+        0,      # seed
+        7.5,    # ss_guidance_strength
+        steps,  # ss_sampling_steps
+        3.0,    # slat_guidance_strength
+        steps,  # slat_sampling_steps
+        api_name="/image_to_3d",
+    )
+    return extract_path(result)
+
+
+def try_trellis_v1_image(tmp_path: str, steps: int) -> str:
+    client = Client("trellis-community/TRELLIS", token=HF_TOKEN)
+    result = client.predict(
+        handle_file(tmp_path),
+        0, 7.5, steps, 3.0, steps, "stochastic",
+        api_name="/image_to_3d",
+    )
+    return extract_path(result)
+
+
+def try_triposg_image(tmp_path: str, steps: int) -> str:
+    client = Client("VAST-AI/TripoSG", token=HF_TOKEN)
+    result = client.predict(
+        handle_file(tmp_path),
+        steps,
+        7.5,
+        1234,
+        api_name="/run",
+    )
+    return extract_path(result)
+
+
+# ─────────────────────────────────────────────
+# ENGINE: TEXTO → 3D
+# ─────────────────────────────────────────────
+
+def try_hunyuan3d_text(prompt: str, steps: int) -> str:
+    client = Client("tencent/Hunyuan3D-2", token=HF_TOKEN)
+    result = client.predict(
+        prompt,
+        "",     # negative prompt
+        1,      # seed
+        steps,
+        7.5,
+        api_name="/text_to_3d",
+    )
+    return extract_path(result)
+
+
+def try_shapeE_text(prompt: str, steps: int) -> str:
+    client = Client("hysts/Shap-E", token=HF_TOKEN)
+    result = client.predict(
+        prompt,
+        15.0,
+        steps,
+        api_name="/text-to-3d",
+    )
+    return extract_path(result)
+
+
+# ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {
-        "status": "online",
-        "engine": "SOMOS Engine v2.2",
+        "status":  "online",
+        "engine":  "SOMOS Engine v3.0",
         "hf_token": bool(HF_TOKEN),
+        "image_engines": IMAGE_ENGINES,
+        "text_engines":  TEXT_ENGINES,
     }
 
 
 @app.get("/status")
 async def status():
     results = {}
-    for name, space in [("trellis2", TRELLIS_SPACE), ("shape_e", SHAPE_SPACE)]:
+    all_spaces = IMAGE_ENGINES + TEXT_ENGINES
+    for space in all_spaces:
         try:
             headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 r = await client.get(
                     f"https://huggingface.co/api/spaces/{space}",
                     headers=headers,
                 )
             data = r.json()
-            results[name] = {
-                "space":  space,
+            results[space] = {
                 "status": data.get("runtime", {}).get("stage", "unknown"),
                 "ok":     r.status_code == 200,
             }
         except Exception as e:
-            results[name] = {"space": space, "status": "error", "error": str(e)}
+            results[space] = {"status": "error", "error": str(e)}
 
     return {
         "api":      "online",
@@ -135,98 +233,88 @@ async def generate(
     style:   str                   = Form("realistic"),
     image:   Optional[UploadFile]  = File(None),
 ):
-    t0 = time.time()
+    t0    = time.time()
+    steps = QUALITY_STEPS.get(quality, 20)
+    errors = []
 
     if not HF_TOKEN:
         return mock_response(mode, prompt, t0, "HF_TOKEN não configurado")
 
-    try:
-        # ==========================================================
-        # IMAGE / CAMERA → 3D  (TRELLIS.2)
-        # ==========================================================
-        if mode in ("image", "camera"):
-            if not image:
-                return mock_response(mode, prompt, t0, "Imagem não recebida")
+    # ==========================================================
+    # IMAGEM → 3D
+    # ==========================================================
+    if mode in ("image", "camera"):
+        if not image:
+            return mock_response(mode, prompt, t0, "Imagem não recebida")
 
-            image_bytes = await image.read()
-            tmp_path = f"/tmp/input_{int(time.time())}.jpg"
-            with open(tmp_path, "wb") as f:
-                f.write(image_bytes)
+        image_bytes = await image.read()
+        tmp_path = f"/tmp/input_{int(time.time())}.jpg"
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
 
-            steps = QUALITY_STEPS.get(quality, 16)
-            model_path = None
+        model_path = None
+        engine_used = None
 
-            # Tenta TRELLIS.2 primeiro
+        # Tenta cada engine em sequência
+        for engine_fn, engine_name in [
+            (lambda: try_hunyuan3d_image(tmp_path, steps), "hunyuan3d-2.1"),
+            (lambda: try_trellis2_image(tmp_path, steps),  "trellis.2"),
+            (lambda: try_trellis_v1_image(tmp_path, steps),"trellis-v1"),
+            (lambda: try_triposg_image(tmp_path, steps),   "triposg"),
+        ]:
             try:
-                client = Client(TRELLIS_SPACE, token=HF_TOKEN)
-                result = client.predict(
-                    handle_file(tmp_path),  # imagem
-                    0,                      # seed
-                    7.5,                    # ss_guidance_strength
-                    steps,                  # ss_sampling_steps
-                    3.0,                    # slat_guidance_strength
-                    steps,                  # slat_sampling_steps
-                    api_name="/image_to_3d",
-                )
-                model_path = extract_path(result)
+                model_path  = engine_fn()
+                engine_used = engine_name
+                break
+            except Exception as e:
+                errors.append(f"{engine_name}: {str(e)[:120]}")
+                continue
 
-            except Exception as e1:
-                # Fallback para TRELLIS v1
-                try:
-                    client = Client(TRELLIS_V1, token=HF_TOKEN)
-                    result = client.predict(
-                        image=handle_file(tmp_path),
-                        multiimages=[],
-                        seed=0,
-                        ss_guidance_strength=7.5,
-                        ss_sampling_steps=steps,
-                        slat_guidance_strength=3.0,
-                        slat_sampling_steps=steps,
-                        multiimage_algo="stochastic",
-                        api_name="/image_to_3d",
-                    )
-                    model_path = extract_path(result)
-                except Exception as e2:
-                    return mock_response(mode, prompt, t0, f"TRELLIS.2: {e1} | v1: {e2}")
+        if not model_path:
+            return mock_response(mode, prompt, t0, " | ".join(errors))
 
-        # ==========================================================
-        # TEXT → 3D  (Shap-E)
-        # ==========================================================
-        else:
-            if not prompt:
-                return mock_response(mode, prompt, t0, "Prompt vazio")
+    # ==========================================================
+    # TEXTO → 3D
+    # ==========================================================
+    else:
+        if not prompt:
+            return mock_response(mode, prompt, t0, "Prompt vazio")
 
-            client = Client(SHAPE_SPACE, token=HF_TOKEN)
-            steps  = QUALITY_STEPS.get(quality, 16)
+        model_path  = None
+        engine_used = None
 
-            result = client.predict(
-                prompt,
-                15.0,
-                steps,
-                api_name="/text-to-3d",
-            )
-            model_path = extract_path(result)
+        for engine_fn, engine_name in [
+            (lambda: try_hunyuan3d_text(prompt, steps), "hunyuan3d-2.0"),
+            (lambda: try_shapeE_text(prompt, steps),    "shap-e"),
+        ]:
+            try:
+                model_path  = engine_fn()
+                engine_used = engine_name
+                break
+            except Exception as e:
+                errors.append(f"{engine_name}: {str(e)[:120]}")
+                continue
 
-        # ── LÊ O ARQUIVO GERADO ───────────────
-        with open(model_path, "rb") as f:
-            model_bytes = f.read()
+        if not model_path:
+            return mock_response(mode, prompt, t0, " | ".join(errors))
 
-        model_hash = compute_hash(model_bytes)
-        engine     = "trellis2" if mode != "text" else "shap-e"
+    # ── LÊ O ARQUIVO GERADO ───────────────────
+    with open(model_path, "rb") as f:
+        model_bytes = f.read()
 
-        return JSONResponse({
-            "success":  True,
-            "modelUrl": f"data:model/gltf-binary;base64,{encode_model(model_bytes)}",
-            "format":   "glb",
-            "hash":     model_hash,
-            "ipfsCid":  f"Qm{model_hash[:44]}",
-            "engine":   engine,
-            "duration": round(time.time() - t0),
-            "mock":     False,
-        })
+    model_hash = compute_hash(model_bytes)
 
-    except Exception as e:
-        return mock_response(mode, prompt, t0, str(e))
+    return JSONResponse({
+        "success":  True,
+        "modelUrl": f"data:model/gltf-binary;base64,{encode_model(model_bytes)}",
+        "format":   "glb",
+        "hash":     model_hash,
+        "ipfsCid":  f"Qm{model_hash[:44]}",
+        "engine":   engine_used,
+        "duration": round(time.time() - t0),
+        "mock":     False,
+        "warnings": errors if errors else None,
+    })
 
 
 @app.post("/hash")
